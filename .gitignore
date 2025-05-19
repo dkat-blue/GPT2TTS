@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+*.env
+
+# Project Specific Data & Materials (as requested)
+data/
+lecture_materials/
+
+# Training Outputs & Checkpoints
+training_runs/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# IDE specific
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sublime-workspace
+
+# OS specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Log files (general, if any are created outside training_runs)
+*.log
+logs/
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
