@@ -27,6 +27,7 @@ The system consists of the following key components:
 
 ## Project Structure
 
+```text
 GPT2TTS/
 ├── .gitignore
 ├── README.md
@@ -53,6 +54,7 @@ GPT2TTS/
         ├── checkpoints/      # Saved model checkpoints
         ├── logs/             # TensorBoard logs
         └── samples/          # Generated audio samples during validation
+```
 
 ## Setup
 
