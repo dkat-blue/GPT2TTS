@@ -16,12 +16,18 @@ env/
 ENV/
 *.env
 
-# Project Specific Data & Materials (as requested)
+# Project Specific Data & Materials
 data/
 lecture_materials/
 
-# Training Outputs & Checkpoints
-training_runs/
+# Pre-trained models
+pretrained_models/
+
+# Ignore all 'checkpoints' subdirectories within any training run folder
+training_runs_mel/*/checkpoints/
+
+# Ignore all 'logs' subdirectories (TensorBoard event files) within any training run folder
+training_runs_mel/*/logs/
 
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints/

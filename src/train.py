@@ -1,208 +1,302 @@
 # src/train.py
 """
-Main script for training the GPT2TTS model.
-Handles dataset loading, model initialization, training/validation loops, and logging.
+Main training script for the GPT2TTSMelPredictor model.
+Handles model initialization, data loading, the training loop,
+validation, checkpointing, and TensorBoard logging.
 """
 import torch
-from torch.optim import AdamW
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from transformers import GPT2Tokenizer, AutoProcessor, get_linear_schedule_with_warmup
-import matplotlib.pyplot as plt
-import time
-import datetime
+from torch.utils.tensorboard import SummaryWriter
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 import os
+import time
 import numpy as np
-from tqdm import tqdm 
+from tqdm import tqdm
+import random
+import soundfile as sf
 
-import config 
-from model import GPT2TTS
-from dataset import get_dataloaders 
-from utils import log_audio_samples
+import config as train_config
+from model import GPT2TTSMelPredictor
+from dataset import get_data_loaders_mel 
+from utils import generate_speech_mel 
+
+def set_seed(seed_value: int):
+    """ Sets the random seed for reproducibility across libraries. """
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+        # These can slow down training, use for debugging or final runs if needed
+        # torch.backends.cudnn.deterministic = True 
+        # torch.backends.cudnn.benchmark = False
 
 def main_train():
-    """Orchestrates the GPT2TTS model training and validation pipeline."""
-    config.create_run_directories()
-    print(f"Using device: {config.DEVICE}")
+    """ Main function to orchestrate the training process. """
+    set_seed(train_config.SEED)
+    device = train_config.DEVICE
+    
+    # --- Setup Output Directories ---
+    run_name = f"training_run_mel_{time.strftime('%Y%m%d-%H%M%S')}"
+    # OUTPUT_DIR is now project_root/training_runs_mel from config
+    current_output_dir = os.path.join(train_config.OUTPUT_DIR, run_name) 
+    checkpoints_dir = os.path.join(current_output_dir, "checkpoints")
+    logs_dir = os.path.join(current_output_dir, "logs") # For TensorBoard
+    samples_dir = os.path.join(current_output_dir, "samples") # For generated audio samples
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(samples_dir, exist_ok=True)
+    
+    writer = SummaryWriter(log_dir=logs_dir)
+    print(f"Training run output will be saved in: {current_output_dir}")
+    print(f"Using device: {device}")
 
-    gpt2_tokenizer = GPT2Tokenizer.from_pretrained(config.GPT2_MODEL_NAME)
-    if gpt2_tokenizer.pad_token is None:
-        gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
-        gpt2_tokenizer.pad_token_id = gpt2_tokenizer.eos_token_id
-
-    encodec_processor = AutoProcessor.from_pretrained(config.ENCODEC_MODEL_NAME)
-
-    print("Preparing DataLoaders...")
-    train_dataloader, val_dataloader = get_dataloaders(
-        encodec_processor, gpt2_tokenizer, 
-        config.VALIDATION_SPLIT_RATIO, config.BATCH_SIZE
+    # --- Data Loaders ---
+    # Max lengths are now taken from config and passed to get_data_loaders_mel
+    train_loader, val_loader, gpt2_tokenizer = get_data_loaders_mel(
+        gpt2_tokenizer_name_or_path=train_config.GPT2_MODEL_NAME,
+        batch_size=train_config.BATCH_SIZE,
+        num_workers=train_config.NUM_WORKERS,
+        pin_memory=train_config.PIN_MEMORY,
+        train_split_ratio=train_config.TRAIN_SPLIT_RATIO,
+        max_text_len=train_config.MAX_TEXT_LEN_DATASET, 
+        max_mel_frames=train_config.MAX_MEL_FRAMES_DATASET, 
+        use_curriculum=train_config.USE_CURRICULUM_LEARNING,
+        # Initial curriculum length, or None if not using curriculum
+        current_max_mel_frames_curriculum=train_config.CURRICULUM_START_MAX_MEL_FRAMES if train_config.USE_CURRICULUM_LEARNING else None
     )
-    if not train_dataloader:
-        print("No training data. Exiting.")
-        return
+    
+    # --- Model Initialization ---
+    model = GPT2TTSMelPredictor.from_pretrained_custom(
+        tokenizer=gpt2_tokenizer, 
+        device=device
+        # checkpoint_path can be passed here to resume, but typically handled by loading best/latest later
+    )
+    
+    if torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel): # Avoid re-wrapping
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel.")
+        model = nn.DataParallel(model)
+    model.to(device)
 
-    print("Initializing GPT2TTS model...")
-    tts_model = GPT2TTS(tokenizer=gpt2_tokenizer).to(config.DEVICE)
+    # --- Optimizer and Scheduler ---
+    optimizer = optim.AdamW(model.parameters(), lr=train_config.LEARNING_RATE, 
+                            weight_decay=train_config.WEIGHT_DECAY, eps=train_config.ADAM_EPSILON)
     
-    optimizer = AdamW(tts_model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    # Total training steps for scheduler
+    num_training_steps = len(train_loader) * train_config.NUM_EPOCHS // train_config.GRADIENT_ACCUMULATION_STEPS
+    
+    if train_config.LR_SCHEDULER_TYPE == "linear":
+        scheduler = get_linear_schedule_with_warmup(optimizer, 
+                                                    num_warmup_steps=train_config.WARMUP_STEPS, 
+                                                    num_training_steps=num_training_steps)
+    elif train_config.LR_SCHEDULER_TYPE == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(optimizer, 
+                                                    num_warmup_steps=train_config.WARMUP_STEPS,
+                                                    num_training_steps=num_training_steps)
+    else: # "constant" or None
+        scheduler = None
 
-    num_training_steps = len(train_dataloader) * config.NUM_EPOCHS
-    print(f"Total training steps: {num_training_steps}")
+    # --- Training Loop ---
+    global_step = 0
+    best_val_loss = float('inf')
+    
+    # Initialize curriculum current max frames for the training loop
+    current_max_frames_for_curriculum_in_loop = train_config.CURRICULUM_START_MAX_MEL_FRAMES \
+        if train_config.USE_CURRICULUM_LEARNING else train_config.MAX_MEL_FRAMES_DATASET
 
-    lr_scheduler = None
-    if config.LR_SCHEDULER_TYPE == "linear_with_warmup":
-        lr_scheduler = get_linear_schedule_with_warmup(
-            optimizer, config.NUM_WARMUP_STEPS, num_training_steps
-        )
-        print(f"Using linear LR scheduler: {config.NUM_WARMUP_STEPS} warmup steps, {num_training_steps} total.")
-
-    all_train_batch_losses, epoch_train_losses, epoch_val_losses = [], [], []
-    best_val_loss, epochs_no_improve = float('inf'), 0
-    
-    current_curriculum_audio_len = config.CURRICULUM_INITIAL_AUDIO_TOKEN_LEN if config.USE_CURRICULUM_LEARNING else None
-    if config.USE_CURRICULUM_LEARNING:
-        print(f"Curriculum learning enabled: initial audio token length = {current_curriculum_audio_len}")
-    
-    start_time_total = time.time()
-    print(f"\n--- Starting Training for {config.NUM_EPOCHS} Epochs ---")
-    
-    epochs_pbar = tqdm(range(config.NUM_EPOCHS), desc="Epochs", unit="epoch", dynamic_ncols=True)
-    
-    for epoch in epochs_pbar: 
-        epoch_start_time = time.time()
-        epochs_pbar.set_description(f"Epoch {epoch+1}/{config.NUM_EPOCHS}")
+    for epoch in range(train_config.NUM_EPOCHS):
+        print(f"\n--- Epoch {epoch+1}/{train_config.NUM_EPOCHS} ---")
         
-        # --- Training Phase ---
-        tts_model.train()
-        current_epoch_train_batch_losses = []
-        num_successful_batches = 0
+        # Update dataset's curriculum parameter if applicable (affects next epoch's data loading if not dynamic)
+        if train_config.USE_CURRICULUM_LEARNING and hasattr(train_loader.dataset, 'current_max_mel_frames_for_curriculum'):
+            train_loader.dataset.current_max_mel_frames_for_curriculum = current_max_frames_for_curriculum_in_loop
+            print(f"Curriculum: Max mel frames for dataset set to {current_max_frames_for_curriculum_in_loop}")
 
-        if config.USE_CURRICULUM_LEARNING:
-            if epoch > 0 and (epoch % config.CURRICULUM_INCREMENT_INTERVAL_EPOCHS == 0):
-                 current_curriculum_audio_len += config.CURRICULUM_INCREMENT_AUDIO_TOKEN_LEN
-                 practical_max_len = tts_model.config.n_positions - 50 
-                 current_curriculum_audio_len = min(current_curriculum_audio_len, practical_max_len) 
-                 tqdm.write(f"Curriculum Update: Max audio token length now {current_curriculum_audio_len}")
-            elif epoch == 0 and config.CURRICULUM_INCREMENT_INTERVAL_EPOCHS == 1:
-                tqdm.write(f"Curriculum: Max audio token length for epoch 1 is {current_curriculum_audio_len}")
+        model.train()
+        epoch_mel_loss_sum = 0.0
+        epoch_scl_loss_sum = 0.0
+        epoch_total_loss_sum = 0.0
+        num_batches_in_epoch = 0
+        
+        optimizer.zero_grad() # Zero gradients at the start of each epoch / accumulation cycle
 
-        for i, batch in enumerate(train_dataloader):
-            optimizer.zero_grad()
-            outputs = tts_model(
-                texts=batch['texts'], audio_waveforms=batch['audio_waveforms'], 
-                return_loss=True, return_dict=True,
-                current_max_audio_tokens_for_curriculum=current_curriculum_audio_len
-            )
-            loss = outputs.loss 
-            if loss is None or torch.isnan(loss) or torch.isinf(loss):
-                if loss is not None: tqdm.write(f"Warning: Invalid training loss epoch {epoch+1}, batch {i+1}.")
+        progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1} Training")
+        for batch_idx, batch in progress_bar:
+            if not batch: # Handle empty batch from collate_fn if all items were skipped
+                print(f"Skipping empty batch at index {batch_idx} in epoch {epoch+1}")
                 continue
+            num_batches_in_epoch +=1
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(tts_model.parameters(), config.MAX_GRAD_NORM)
-            optimizer.step()
-            if lr_scheduler: lr_scheduler.step()
+            text_input_ids = batch["text_input_ids"].to(device)
+            text_attention_mask = batch["text_attention_mask"].to(device)
+            target_mel = batch["target_mel_spectrogram"].to(device)
+            teacher_forcing_mel = batch["teacher_forcing_mel_spectrogram"].to(device)
+            mel_actual_frame_mask = batch["mel_actual_frame_mask"].to(device) 
+            ref_audio_wav = batch["reference_audio_waveform"].to(device)
+            ref_audio_sr = batch["reference_audio_sample_rate"] # Scalar, from first item
+
+            # Forward pass
+            model_outputs = model(
+                text_input_ids=text_input_ids,
+                reference_audio_waveform=ref_audio_wav, 
+                reference_audio_sample_rate=ref_audio_sr,
+                target_mel_spectrogram=target_mel,
+                input_mel_spectrogram_shifted=teacher_forcing_mel, 
+                text_attention_mask=text_attention_mask,
+                mel_actual_frame_mask=mel_actual_frame_mask 
+            )
             
-            current_epoch_train_batch_losses.append(loss.item())
-            num_successful_batches +=1
-            if num_successful_batches > 0:
-                epochs_pbar.set_postfix({
-                    'Train Loss': f"{np.mean(current_epoch_train_batch_losses):.4f}",
-                    'LR': f"{optimizer.param_groups[0]['lr']:.2e}"
-                })
-        
-        avg_train_loss = np.mean(current_epoch_train_batch_losses) if current_epoch_train_batch_losses else float('nan') 
-        epoch_train_losses.append(avg_train_loss)
-        tqdm.write(f"Epoch {epoch+1} Train Summary: Avg Loss={avg_train_loss:.4f} ({num_successful_batches}/{len(train_dataloader)} batches)")
+            mel_loss = model_outputs["mel_loss"]
+            scl_proxy_loss = model_outputs["scl_proxy_loss"]
+            
+            current_total_loss = mel_loss + scl_proxy_loss * train_config.SCL_PROXY_WEIGHT
+            
+            # Normalize loss for gradient accumulation
+            accumulated_loss = current_total_loss / train_config.GRADIENT_ACCUMULATION_STEPS
+            accumulated_loss.backward()
 
-        # --- Validation Phase ---
-        avg_val_loss = float('nan')
-        if val_dataloader and num_successful_batches > 0:
-            tts_model.eval()
-            current_epoch_val_losses_list = [] # Store batch losses for current val epoch
-            with torch.no_grad():
-                for val_batch in val_dataloader:
-                    val_outputs = tts_model(
-                        texts=val_batch['texts'], audio_waveforms=val_batch['audio_waveforms'],
-                        return_loss=True, return_dict=True,
-                        current_max_audio_tokens_for_curriculum=current_curriculum_audio_len
+            # Accumulate per-batch (non-normalized by grad_accum) losses for epoch average
+            epoch_mel_loss_sum += mel_loss.item()
+            epoch_scl_loss_sum += scl_proxy_loss.item()
+            epoch_total_loss_sum += current_total_loss.item()
+
+
+            if (batch_idx + 1) % train_config.GRADIENT_ACCUMULATION_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.MAX_GRAD_NORM)
+                optimizer.step()
+                if scheduler: 
+                    scheduler.step()
+                optimizer.zero_grad() # Zero gradients after optimizer step
+                global_step += 1
+
+                # Log training losses (current batch's effective loss)
+                if global_step % train_config.LOG_INTERVAL == 0:
+                    writer.add_scalar("Loss_Batch/train_mel", mel_loss.item(), global_step)
+                    writer.add_scalar("Loss_Batch/train_scl_proxy", scl_proxy_loss.item(), global_step)
+                    writer.add_scalar("Loss_Batch/train_total", current_total_loss.item(), global_step)
+                    writer.add_scalar("LearningRate", optimizer.param_groups[0]['lr'], global_step)
+                    progress_bar.set_postfix({
+                        "mel_loss": f"{mel_loss.item():.4f}", 
+                        "scl_loss": f"{scl_proxy_loss.item():.4f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}"
+                    })
+
+                # --- Validation and Checkpointing (based on global_step) ---
+                if global_step > 0 and global_step % train_config.VALIDATION_INTERVAL == 0:
+                    model.eval()
+                    val_mel_loss_sum = 0.0
+                    val_scl_loss_sum = 0.0
+                    val_total_loss_sum = 0.0
+                    num_val_batches = 0
+                    with torch.no_grad():
+                        val_progress_bar = tqdm(val_loader, total=len(val_loader), desc=f"Step {global_step} Validation", leave=False)
+                        for val_batch_idx, val_batch in enumerate(val_progress_bar):
+                            if not val_batch: continue # Skip empty val batches
+                            num_val_batches += 1
+                            v_txt_ids = val_batch["text_input_ids"].to(device)
+                            v_txt_mask = val_batch["text_attention_mask"].to(device)
+                            v_tgt_mel = val_batch["target_mel_spectrogram"].to(device)
+                            v_teacher_mel = val_batch["teacher_forcing_mel_spectrogram"].to(device)
+                            v_mel_mask = val_batch["mel_actual_frame_mask"].to(device)
+                            v_ref_wav = val_batch["reference_audio_waveform"].to(device)
+                            v_ref_sr = val_batch["reference_audio_sample_rate"]
+
+                            val_model_outputs = model(
+                                text_input_ids=v_txt_ids, reference_audio_waveform=v_ref_wav,
+                                reference_audio_sample_rate=v_ref_sr, target_mel_spectrogram=v_tgt_mel,
+                                input_mel_spectrogram_shifted=v_teacher_mel, text_attention_mask=v_txt_mask,
+                                mel_actual_frame_mask=v_mel_mask
+                            )
+                            val_mel_loss = val_model_outputs["mel_loss"]
+                            val_scl_proxy_loss = val_model_outputs["scl_proxy_loss"]
+                            val_current_total_loss = val_mel_loss + val_scl_proxy_loss * train_config.SCL_PROXY_WEIGHT
+
+                            val_mel_loss_sum += val_mel_loss.item()
+                            val_scl_loss_sum += val_scl_proxy_loss.item()
+                            val_total_loss_sum += val_current_total_loss.item()
+                            val_progress_bar.set_postfix({"val_mel_loss": f"{val_mel_loss.item():.4f}"})
+                    
+                    avg_val_mel_loss = val_mel_loss_sum / num_val_batches if num_val_batches > 0 else 0
+                    avg_val_scl_loss = val_scl_loss_sum / num_val_batches if num_val_batches > 0 else 0
+                    avg_val_total_loss = val_total_loss_sum / num_val_batches if num_val_batches > 0 else 0
+                    
+                    writer.add_scalar("Loss_Val/mel", avg_val_mel_loss, global_step)
+                    writer.add_scalar("Loss_Val/scl_proxy", avg_val_scl_loss, global_step)
+                    writer.add_scalar("Loss_Val/total", avg_val_total_loss, global_step)
+                    print(f"\nValidation @ Step {global_step}: Total Loss: {avg_val_total_loss:.4f}, Mel Loss: {avg_val_mel_loss:.4f}, SCL Proxy: {avg_val_scl_loss:.4f}")
+
+                    # Save checkpoints
+                    save_path_latest = os.path.join(checkpoints_dir, "latest_model_checkpoint.pth")
+                    torch.save(model.state_dict(), save_path_latest)
+                    if avg_val_total_loss < best_val_loss:
+                        best_val_loss = avg_val_total_loss
+                        save_path_best = os.path.join(checkpoints_dir, "best_val_loss_model.pth")
+                        torch.save(model.state_dict(), save_path_best)
+                        print(f"Best val loss improved to {best_val_loss:.4f}. Checkpoint saved: {save_path_best}")
+                    
+                    # Log a generated audio sample
+                    try:
+                        sample_text_val = "This is a validation audio sample."
+                        # Use a reference audio from the current validation batch
+                        if val_loader.dataset and len(val_loader.dataset) > 0 and val_batch: 
+                             val_ref_audio_for_sample = val_batch["reference_audio_waveform"][0].cpu() 
+                             val_ref_sr_for_sample = val_batch["reference_audio_sample_rate"] 
+
+                             generated_waveform_np_val = generate_speech_mel(
+                                 model.module if hasattr(model, 'module') else model,
+                                 sample_text_val, val_ref_audio_for_sample, val_ref_sr_for_sample, device,
+                                 max_mel_frames=train_config.LOGGING_MAX_MEL_FRAMES
+                             )
+                             if generated_waveform_np_val is not None:
+                                 sample_filename_val = os.path.join(samples_dir, f"sample_step{global_step}.wav")
+                                 sf.write(sample_filename_val, generated_waveform_np_val, train_config.TARGET_SAMPLE_RATE)
+                                 writer.add_audio(f"AudioSample_Val/step{global_step}", generated_waveform_np_val, 
+                                                  global_step, sample_rate=train_config.TARGET_SAMPLE_RATE)
+                                 print(f"Logged validation audio sample: {sample_filename_val}")
+                        else:
+                            print("Skipping validation audio sample generation (val_batch empty or problematic).")
+                    except Exception as e_gen_val:
+                        print(f"Error during validation sample generation: {e_gen_val}")
+                    model.train() # Switch back to training mode
+
+                # Update curriculum learning max frames
+                if train_config.USE_CURRICULUM_LEARNING and \
+                   current_max_frames_for_curriculum_in_loop < train_config.CURRICULUM_END_MAX_MEL_FRAMES and \
+                   global_step > 0 and global_step % train_config.CURRICULUM_INCREMENT_STEPS == 0:
+                    current_max_frames_for_curriculum_in_loop = min(
+                        current_max_frames_for_curriculum_in_loop + train_config.CURRICULUM_INCREMENT_AMOUNT,
+                        train_config.CURRICULUM_END_MAX_MEL_FRAMES
                     )
-                    val_loss_item = val_outputs.loss
-                    if val_loss_item is not None and not (torch.isnan(val_loss_item) or torch.isinf(val_loss_item)):
-                        current_epoch_val_losses_list.append(val_loss_item.item())
-                        if current_epoch_val_losses_list: # Check if list is not empty
-                             epochs_pbar.set_postfix({
-                                'Train Loss': f"{avg_train_loss:.4f}", 
-                                'Val Loss': f"{np.mean(current_epoch_val_losses_list):.4f}", # Running avg val loss
-                                'LR': f"{optimizer.param_groups[0]['lr']:.2e}"
-                            })
-            avg_val_loss = np.mean(current_epoch_val_losses_list) if current_epoch_val_losses_list else float('nan')
-            epoch_val_losses.append(avg_val_loss)
-            tqdm.write(f"Epoch {epoch+1} Val Summary: Avg Loss={avg_val_loss:.4f}")
-        else:
-            epoch_val_losses.append(float('nan')) # Record NaN if no validation
-            if not val_dataloader: tqdm.write(f"Epoch {epoch+1}: No validation dataloader.")
-            else: tqdm.write(f"Epoch {epoch+1}: Skipping validation (no successful train batches).")
-
-        # --- Checkpointing & Early Stopping ---
-        if num_successful_batches > 0:
-            torch.save(tts_model.state_dict(), config.LATEST_MODEL_CHECKPOINT_FILE)
-            loss_for_comp = avg_val_loss if val_dataloader and not np.isnan(avg_val_loss) else avg_train_loss
-            if not np.isnan(loss_for_comp) and loss_for_comp < best_val_loss - config.MIN_DELTA_IMPROVEMENT:
-                best_val_loss = loss_for_comp
-                torch.save(tts_model.state_dict(), config.BEST_MODEL_VAL_CHECKPOINT_FILE)
-                metric_name = "val_loss" if val_dataloader and not np.isnan(avg_val_loss) else "train_loss"
-                tqdm.write(f"Saved best model ({metric_name}: {best_val_loss:.4f})")
-                epochs_no_improve = 0
-            elif not np.isnan(loss_for_comp): epochs_no_improve += 1
+                    # Update the dataset instance directly for the next epoch's item fetching
+                    if hasattr(train_loader.dataset, 'current_max_mel_frames_for_curriculum'):
+                        train_loader.dataset.current_max_mel_frames_for_curriculum = current_max_frames_for_curriculum_in_loop
+                        print(f"Curriculum Update @ Step {global_step}: Max mel frames for dataset set to {current_max_frames_for_curriculum_in_loop}")
         
-        epoch_duration = str(datetime.timedelta(seconds=int(time.time() - epoch_start_time)))
-        final_postfix = {'Train Loss': f"{avg_train_loss:.4f}" if not np.isnan(avg_train_loss) else "N/A",
-                         'LR': f"{optimizer.param_groups[0]['lr']:.2e}", 'Epoch Time': epoch_duration}
-        if not np.isnan(avg_val_loss): final_postfix['Val Loss'] = f"{avg_val_loss:.4f}"
-        else: final_postfix['Val Loss'] = "N/A"
-        epochs_pbar.set_postfix(final_postfix)
+        # End of epoch logging
+        avg_epoch_mel_loss = epoch_mel_loss_sum / num_batches_in_epoch if num_batches_in_epoch > 0 else 0
+        avg_epoch_scl_loss = epoch_scl_loss_sum / num_batches_in_epoch if num_batches_in_epoch > 0 else 0
+        avg_epoch_total_loss = epoch_total_loss_sum / num_batches_in_epoch if num_batches_in_epoch > 0 else 0
+        writer.add_scalar("Loss_Epoch/train_mel", avg_epoch_mel_loss, epoch + 1)
+        writer.add_scalar("Loss_Epoch/train_scl_proxy", avg_epoch_scl_loss, epoch + 1)
+        writer.add_scalar("Loss_Epoch/train_total", avg_epoch_total_loss, epoch + 1)
+        print(f"--- Epoch {epoch+1} Complete. Avg Total Loss: {avg_epoch_total_loss:.4f}, Avg Mel Loss: {avg_epoch_mel_loss:.4f}, Avg SCL Proxy: {avg_epoch_scl_loss:.4f} ---")
 
-        log_audio_samples(tts_model, epoch + 1, config.DEVICE)
-        tqdm.write(f"Epoch {epoch+1} duration: {epoch_duration}\n") 
-
-        if val_dataloader and epochs_no_improve >= config.EARLY_STOPPING_PATIENCE and not np.isnan(avg_val_loss):
-            tqdm.write(f"Early stopping after {epoch+1} epochs.")
-            break
-    epochs_pbar.close()
-            
-    print(f"--- Training Finished --- Total time: {datetime.timedelta(seconds=int(time.time() - start_time_total))}")
-
-    # --- Plotting ---
-    if all_train_batch_losses:
-        plt.figure(figsize=(12,6)); plt.plot(all_train_batch_losses, label="Train Batch Loss")
-        plt.title('Train Batch Loss Over Steps'); plt.xlabel('Batch Num'); plt.ylabel('Loss'); plt.grid(True); plt.legend()
-        try: plt.savefig(config.TRAIN_LOSS_CHART_FILE); print(f"Saved: {config.TRAIN_LOSS_CHART_FILE}")
-        except Exception as e: print(f"Error saving train loss chart: {e}"); plt.close()
-
-    train_losses_plot = [l for l in epoch_train_losses if not np.isnan(l)]
-    val_losses_plot = [l for l in epoch_val_losses if not np.isnan(l)]
-    if train_losses_plot:
-        plt.figure(figsize=(12,6)); plt.plot(range(len(train_losses_plot)), train_losses_plot, label="Avg Train Loss/Epoch", marker='o')
-        if val_losses_plot: plt.plot(range(len(val_losses_plot)), val_losses_plot, label="Avg Val Loss/Epoch", marker='x')
-        plt.title('Avg Train & Val Loss Over Epochs'); plt.xlabel('Epoch'); plt.ylabel('Avg Loss')
-        plt.xticks(range(max(len(train_losses_plot), len(val_losses_plot) if val_losses_plot else 0))) 
-        plt.grid(True); plt.legend()
-        try: plt.savefig(config.VAL_LOSS_CHART_FILE); print(f"Saved: {config.VAL_LOSS_CHART_FILE}")
-        except Exception as e: print(f"Error saving val loss chart: {e}"); plt.close()
-
-    # --- Final Logging ---
-    with open(config.TRAINING_LOG_FILE, "w") as f:
-        f.write(f"Training Run: {config.RUN_ID} @ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Epochs Planned: {config.NUM_EPOCHS}, Run: {epoch + 1}\n")
-        f.write(f"Samples: {config.MAX_TOTAL_SAMPLES or 'All'}, Val Ratio: {config.VALIDATION_SPLIT_RATIO}\n")
-        f.write(f"LR: {config.LEARNING_RATE}, Weight Decay: {config.WEIGHT_DECAY}, Label Smooth: {config.LABEL_SMOOTHING}\n")
-        f.write(f"Batch Size: {config.BATCH_SIZE}, Device: {config.DEVICE}\n")
-        f.write(f"Curriculum: {config.USE_CURRICULUM_LEARNING}, Initial Len: {config.CURRICULUM_INITIAL_AUDIO_TOKEN_LEN if config.USE_CURRICULUM_LEARNING else 'N/A'}\n")
-        best_loss_str = f"{best_val_loss:.4f}" if best_val_loss != float('inf') else "N/A"
-        f.write(f"Best Val/Train Loss: {best_loss_str}\n")
-        final_train_str = f"{epoch_train_losses[-1]:.4f}" if epoch_train_losses and not np.isnan(epoch_train_losses[-1]) else "N/A"
-        f.write(f"Final Avg Train Loss: {final_train_str}\n")
-    print(f"Training summary saved to {config.TRAINING_LOG_FILE}")
+    writer.close()
+    print("--- Training Finished ---")
 
 if __name__ == '__main__':
-    main_train()
+    # This structure allows running train.py directly.
+    # Ensure DATA_DIR in config.py is correctly set.
+    if not os.path.exists(train_config.DATA_DIR) or \
+       not os.path.exists(train_config.METADATA_FILE) or \
+       not os.path.exists(train_config.WAVS_DIR):
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print(f"! ERROR: Dataset path not correctly configured in src/config.py.             !")
+        print(f"! Please ensure DATA_DIR ('{train_config.DATA_DIR}') and its contents exist.   !")
+        print(f"! Specifically, METADATA_FILE: '{train_config.METADATA_FILE}'")
+        print(f"! and WAVS_DIR: '{train_config.WAVS_DIR}' must be valid paths.")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    else:
+        main_train()

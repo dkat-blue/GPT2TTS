@@ -1,322 +1,442 @@
 # src/model.py
 """
-Defines the GPT2TTS model, combining GPT-2 for autoregressive processing
-and Encodec for audio tokenization/decoding.
+Defines the GPT2TTSMelPredictor model architecture, which predicts mel spectrograms
+from text, conditioned on reference audio. Uses a pre-trained HiFi-GAN vocoder
+for waveform synthesis.
 """
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence 
-from transformers import (
-    GPT2Tokenizer, GPT2Model, GPT2PreTrainedModel, GPT2Config,
-    EncodecModel, AutoProcessor, GenerationConfig, GenerationMixin  
-)
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from typing import List, Optional, Tuple, Dict
-import numpy as np
-import config 
+import torch.nn.functional as F
+from transformers import GPT2LMHeadModel, GPT2Config, GPT2Tokenizer
+from typing import Optional, Tuple, Union, List, Dict
+import math
+import os
 
-class GPT2TTS(GPT2PreTrainedModel, GenerationMixin):
+import config as model_config
+
+from speechbrain.inference.classifiers import EncoderClassifier 
+from speechbrain.inference.vocoders import HIFIGAN 
+import torchaudio.transforms as T
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    """ Sinusoidal Positional Embedding for the Conditioning Encoder. """
+    def __init__(self, d_model: int, max_len: int = 1000): # Max length for typical reference mel spectrograms
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (batch_size, seq_len_mel_ref, cond_encoder_embed_dim)
+        return self.pe[:, :x.size(1)]
+
+
+class ConditioningEncoder(nn.Module):
     """
-    GPT2TTS model for text-to-speech.
-    Uses GPT-2 for autoregressive generation of discrete audio tokens from Encodec.
+    Encodes reference audio (mel spectrogram) into a sequence of embeddings
+    using Transformer Encoder layers.
     """
-    def __init__(self, tokenizer: GPT2Tokenizer, n_special_tokens: int = 2): 
-        """
-        Initializes the GPT2TTS model.
-
-        Args:
-            tokenizer: Initialized GPT2Tokenizer. Its properties (vocab_size, pad_token_id)
-                       are used to configure the internal GPT2Model.
-            n_special_tokens: Number of special audio tokens (e.g., BOS_AUDIO, EOS_AUDIO).
-        """
-        base_config_name = tokenizer.name_or_path if tokenizer.name_or_path else config.GPT2_MODEL_NAME
-        base_gpt2_config = GPT2Config.from_pretrained(base_config_name)
-
-        # Construct final GPT-2 config, ensuring vocab consistency with the tokenizer.
-        final_gpt2_model_config = GPT2Config(
-            vocab_size=tokenizer.vocab_size,
-            pad_token_id=tokenizer.pad_token_id,
-            n_positions=base_gpt2_config.n_positions,
-            n_embd=base_gpt2_config.n_embd,
-            n_layer=base_gpt2_config.n_layer,
-            n_head=base_gpt2_config.n_head,
-            n_inner=base_gpt2_config.n_inner,
-            activation_function=base_gpt2_config.activation_function,
-            resid_pdrop=base_gpt2_config.resid_pdrop,
-            embd_pdrop=base_gpt2_config.embd_pdrop,
-            attn_pdrop=base_gpt2_config.attn_pdrop,
-            layer_norm_epsilon=base_gpt2_config.layer_norm_epsilon,
-            initializer_range=base_gpt2_config.initializer_range,
-            tie_word_embeddings=False, # Word embeddings not tied to output layer.
-            name_or_path=base_config_name 
+    def __init__(self, input_dim: int, embed_dim: int, output_dim: int, 
+                 n_layers: int, n_heads: int, dropout: float = 0.1, 
+                 max_ref_mel_len: int = 1000):
+        super().__init__()
+        self.input_projection = nn.Linear(input_dim, embed_dim)
+        self.pos_encoder = SinusoidalPositionalEmbedding(embed_dim, max_len=max_ref_mel_len)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 4,
+            dropout=dropout, batch_first=True, activation=F.gelu
         )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.output_projection = nn.Linear(embed_dim, output_dim)
+        self.layer_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, mel_spectrogram: torch.Tensor, 
+                padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # mel_spectrogram shape: (batch_size, n_mels, seq_len_mel_ref)
+        # Permute to (batch_size, seq_len_mel_ref, n_mels) for linear layer and transformer
+        x = mel_spectrogram.permute(0, 2, 1) 
+        x = self.input_projection(x)
+        x = x + self.pos_encoder(x) 
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
+        x = self.output_projection(x)
+        x = self.layer_norm(x)
+        return x # Shape: (batch_size, seq_len_mel_ref, cond_encoder_output_dim)
+
+
+class PerceiverResampler(nn.Module):
+    """
+    Perceiver Resampler to distill a variable-length sequence (from ConditioningEncoder)
+    into a fixed number of latent vectors using cross-attention.
+    """
+    def __init__(self, input_dim: int, latent_dim: int, num_latents: int, 
+                 num_heads: int, num_layers: int, dropout: float = 0.1):
+        super().__init__()
+        self.num_latents = num_latents
+        self.latent_queries = nn.Parameter(torch.randn(1, num_latents, latent_dim))
         
-        super().__init__(final_gpt2_model_config) 
-        self.config = final_gpt2_model_config     
-        self.tokenizer = tokenizer          
+        self.cross_attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=latent_dim, num_heads=num_heads, 
+                                  dropout=dropout, batch_first=True)
+            for _ in range(num_layers)
+        ])
+        self.ffn_layers = nn.ModuleList([
+            nn.Sequential(nn.Linear(latent_dim, latent_dim * 4), nn.GELU(),
+                          nn.Linear(latent_dim * 4, latent_dim), nn.Dropout(dropout))
+            for _ in range(num_layers)
+        ])
+        self.norm1_layers = nn.ModuleList([nn.LayerNorm(latent_dim) for _ in range(num_layers)])
+        self.norm2_layers = nn.ModuleList([nn.LayerNorm(latent_dim) for _ in range(num_layers)])
 
-        self.gpt2_model = GPT2Model(self.config) 
+    def forward(self, context: torch.Tensor, 
+                context_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # context shape: (batch_size, seq_len_context, input_dim)
+        batch_size = context.size(0)
+        latents = self.latent_queries.expand(batch_size, -1, -1) # (B, num_latents, latent_dim)
 
-        self.codec = EncodecModel.from_pretrained(config.ENCODEC_MODEL_NAME)
-        self.processor = AutoProcessor.from_pretrained(config.ENCODEC_MODEL_NAME)
+        for i in range(len(self.cross_attention_layers)):
+            attn_output, _ = self.cross_attention_layers[i](
+                query=latents, key=context, value=context, 
+                key_padding_mask=context_padding_mask
+            )
+            latents = self.norm1_layers[i](latents + attn_output) # Add & Norm
+            
+            ffn_output = self.ffn_layers[i](latents)
+            latents = self.norm2_layers[i](latents + ffn_output) # Add & Norm
+            
+        return latents # Shape: (batch_size, num_latents, latent_dim)
+
+
+class GPT2TTSMelPredictor(nn.Module):
+    """
+    GPT-2 based model for Text-to-Speech that predicts mel spectrograms.
+    It's conditioned on text and reference audio style.
+    Uses a pre-trained HiFi-GAN vocoder for waveform synthesis.
+    """
+    def __init__(self, tokenizer: GPT2Tokenizer):
+        super().__init__()
+        self.tokenizer = tokenizer # For text tokenization
+        self.gpt2_config = GPT2Config.from_pretrained(
+            model_config.GPT2_MODEL_NAME,
+            vocab_size=len(tokenizer), 
+            n_positions=model_config.GPT2_N_POSITIONS, 
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+        )
+        self.gpt2 = GPT2LMHeadModel.from_pretrained(model_config.GPT2_MODEL_NAME, config=self.gpt2_config)
+        # Replace GPT-2's lm_head to output mel bins instead of vocabulary logits
+        self.gpt2.lm_head = nn.Linear(self.gpt2_config.hidden_size, model_config.GPT2_OUTPUT_MEL_BINS)
+        print(f"Replaced GPT-2 lm_head to output {model_config.GPT2_OUTPUT_MEL_BINS} mel bins.")
+        print(f"GPT-2 configured with n_positions: {self.gpt2_config.n_positions}")
+
+        # Mel spectrogram transformation for reference audio conditioning
+        self.mel_spectrogram_transform_ref = T.MelSpectrogram(
+            sample_rate=model_config.TARGET_SAMPLE_RATE,
+            n_fft=model_config.MEL_N_FFT, hop_length=model_config.MEL_HOP_LENGTH,
+            win_length=model_config.MEL_WIN_LENGTH, n_mels=model_config.MEL_N_MELS, 
+            f_min=model_config.MEL_FMIN, f_max=model_config.MEL_FMAX,
+            power=2.0 # Using power spectrogram for conditioning encoder
+        )
+
+        # Conditioning components
+        max_ref_mel_len = int((model_config.REFERENCE_AUDIO_MAX_DURATION_SEC * model_config.TARGET_SAMPLE_RATE) / model_config.MEL_HOP_LENGTH) + 10 
+        self.conditioning_encoder = ConditioningEncoder(
+            input_dim=model_config.COND_ENC_INPUT_DIM, 
+            embed_dim=model_config.COND_ENC_EMBED_DIM,
+            output_dim=model_config.COND_ENC_OUTPUT_DIM,
+            n_layers=model_config.COND_ENC_N_ATTN_LAYERS,
+            n_heads=model_config.COND_ENC_N_HEADS,
+            max_ref_mel_len=max_ref_mel_len
+        )
+        self.perceiver_resampler = PerceiverResampler(
+            input_dim=model_config.COND_ENC_OUTPUT_DIM,
+            latent_dim=model_config.PERCEIVER_LATENT_DIM,
+            num_latents=model_config.PERCEIVER_N_LATENTS,
+            num_heads=model_config.PERCEIVER_N_HEADS,
+            num_layers=model_config.PERCEIVER_N_CROSS_ATTN_LAYERS
+        )
+
+        # Speaker Encoder for SCL Proxy
+        try:
+            self.speaker_encoder = EncoderClassifier.from_hparams(
+                source=model_config.SPEAKER_ENCODER_MODEL_NAME,
+                savedir=os.path.join(model_config.PROJECT_ROOT, "pretrained_models", model_config.SPEAKER_ENCODER_MODEL_NAME.replace("/", "_")),
+                run_opts={"device": model_config.DEVICE}
+            )
+            self.speaker_encoder.eval() # Set to evaluation mode
+            print(f"Speaker encoder {model_config.SPEAKER_ENCODER_MODEL_NAME} loaded.")
+        except Exception as e:
+            print(f"Error loading speaker encoder: {e}. SCL Proxy will not be available.")
+            self.speaker_encoder = None
         
-        self.embedding_padding_value = 0.0 # Padding for embedding tensors.
-
-        # Loss function with label smoothing, ignores padding index -100.
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=config.LABEL_SMOOTHING) 
+        # Projection layer for SCL Proxy if dimensions mismatch
+        if model_config.COND_ENC_OUTPUT_DIM != model_config.SCL_PROXY_PROJECTION_DIM:
+            self.scl_style_projection = nn.Linear(model_config.COND_ENC_OUTPUT_DIM, model_config.SCL_PROXY_PROJECTION_DIM)
+            print(f"Added SCL projection layer: {model_config.COND_ENC_OUTPUT_DIM} -> {model_config.SCL_PROXY_PROJECTION_DIM}")
+        else:
+            self.scl_style_projection = nn.Identity()
         
-        self.n_special_tokens = n_special_tokens 
-        self.num_audio_codebooks = self.codec.config.num_quantizers 
-        self.codebook_size = self.codec.config.codebook_size 
+        # HiFi-GAN Vocoder
+        try:
+            self.hifi_gan = HIFIGAN.from_hparams(
+                source=model_config.HIFIGAN_MODEL_SOURCE,
+                savedir=model_config.HIFIGAN_SAVEDIR,
+                run_opts={"device": model_config.DEVICE}
+            )
+            self.hifi_gan.eval() # Set to evaluation mode
+            print(f"HiFi-GAN vocoder {model_config.HIFIGAN_MODEL_SOURCE} loaded.")
+        except Exception as e:
+            print(f"Error loading HiFi-GAN vocoder: {e}. Waveform generation will not be available.")
+            self.hifi_gan = None
+            
+        # Input projection for mel frames fed into GPT-2 during teacher forcing/generation
+        self.mel_input_projection = nn.Linear(model_config.MEL_N_MELS, self.gpt2_config.hidden_size)
+        # Learnable start-of-mel-sequence embedding
+        self.start_mel_embedding = nn.Parameter(torch.randn(1, 1, self.gpt2_config.hidden_size))
+
+
+    def get_speaker_embedding(self, audio_waveform: torch.Tensor, sample_rate: int) -> Optional[torch.Tensor]:
+        """ Extracts speaker embedding from an audio waveform. """
+        if self.speaker_encoder is None: return None
+        if audio_waveform.ndim == 1: audio_waveform = audio_waveform.unsqueeze(0) # Add batch dim
         
-        self.audio_vocab_size = self.codebook_size + self.n_special_tokens
-        self.audio_emb = nn.Embedding(self.audio_vocab_size, self.config.n_embd) # Audio token embeddings.
-        self.lm_head = nn.Linear(self.config.n_embd, self.audio_vocab_size, bias=False) # Projects to audio vocab.
-        
-        self.bos_audio_token_id = self.codebook_size 
-        self.eos_audio_token_id = self.codebook_size + 1 
-        
-        print(f"GPT2TTS initialized. Audio vocab size: {self.audio_vocab_size}")
-        print(f"GPT2Model using config: vocab_size={self.config.vocab_size}, pad_token_id={self.config.pad_token_id}")
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        """Returns GPT-2's input (text) token embeddings."""
-        return self.gpt2_model.wte 
-
-    def get_output_embeddings(self) -> nn.Linear:
-        """Returns the output LM head for audio tokens."""
-        return self.lm_head 
-
-    def can_generate(self) -> bool: 
-        """Flags model for Hugging Face .generate() compatibility."""
-        return True
-
-    def _escape_fstring_text(self, text_segment: str) -> str:
-        """Escapes special characters for safe f-string logging."""
-        return text_segment.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace("'", "\\'").replace('"', '\\"')
-
-    def preprocess_text_and_audio(self, texts: List[str], audio_waveforms: List[np.ndarray], 
-                                  device: torch.device) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Preprocesses batch of texts and audio: text tokenization, Encodec audio tokenization,
-        and flattening of audio codes. Skips erroneous samples.
-
-        Args:
-            texts: List of input text strings.
-            audio_waveforms: List of NumPy audio waveforms.
-            device: Torch device for tensors.
-
-        Returns:
-            Tuple: (list of text token Tensors, list of flattened audio token Tensors).
-        """
-        valid_text_tokens_list = []
-        valid_audio_tokens_list = []
-
-        for text, waveform in zip(texts, audio_waveforms):
-            try:
-                max_text_tokens = self.config.n_positions // 3 
-                text_encoding = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=max_text_tokens) 
-                current_text_tokens = text_encoding.input_ids.squeeze(0).to(device) 
-                if current_text_tokens.numel() == 0 or waveform.size == 0: continue
-
-                inputs = self.processor(raw_audio=waveform, sampling_rate=self.processor.sampling_rate, return_tensors="pt")
-                input_values = inputs["input_values"].to(device) 
-                if input_values.numel() == 0: continue
-                
-                padding_mask_proc = inputs.get("padding_mask", None) 
-                if padding_mask_proc is not None: padding_mask_proc = padding_mask_proc.to(device)
-
-                with torch.no_grad(): 
-                    self.codec.to(input_values.device)
-                    encoder_outputs = self.codec.encode(
-                        input_values, padding_mask=padding_mask_proc, 
-                        bandwidth=config.ENCODEC_BANDWIDTH_TRAIN 
-                    )
-                codes_from_encodec = encoder_outputs.audio_codes # (1, B, Nq, T) or (1,1,Nq,T)
-                
-                current_codes = codes_from_encodec.squeeze(0).squeeze(0) # Expect (Nq, T) for single sample
-                                
-                if current_codes.dim() != 2 or current_codes.shape[0] != self.num_audio_codebooks or current_codes.shape[1] == 0:
-                    continue
-                                
-                flattened_audio_tokens = current_codes.T.reshape(-1).to(device)
-                if flattened_audio_tokens.numel() == 0: continue
-
-                valid_text_tokens_list.append(current_text_tokens)
-                valid_audio_tokens_list.append(flattened_audio_tokens)
-            except Exception:
-                continue # Skip problematic sample
-        return valid_text_tokens_list, valid_audio_tokens_list
+        # Resample to 16kHz if necessary, as expected by ECAPA-TDNN
+        if sample_rate != 16000: 
+            resampler = T.Resample(orig_freq=sample_rate, new_freq=16000).to(audio_waveform.device)
+            audio_waveform = resampler(audio_waveform)
+        try:
+            with torch.no_grad():
+                # SpeechBrain's ECAPA-TDNN encode_batch returns (batch, 1, embed_dim)
+                embeddings = self.speaker_encoder.encode_batch(audio_waveform).squeeze(dim=1) 
+            return embeddings # Shape: (batch, embed_dim)
+        except Exception as e:
+            print(f"Error during speaker embedding extraction: {e}"); return None
 
     def forward(
-        self, input_ids: Optional[torch.Tensor] = None, attention_mask: Optional[torch.Tensor] = None, 
-        audio_waveforms: Optional[List[np.ndarray]] = None, texts: Optional[List[str]] = None, 
-        return_loss: bool = False, inputs_embeds: Optional[torch.Tensor] = None, 
-        labels: Optional[torch.Tensor] = None, past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None, 
-        use_cache: Optional[bool] = None, output_attentions: Optional[bool] = None, 
-        output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None, 
-        prompt_text_length: Optional[int] = None, 
-        current_max_audio_tokens_for_curriculum: Optional[int] = None, 
-        **kwargs 
-    ) -> CausalLMOutputWithPast: 
+        self,
+        text_input_ids: torch.Tensor,                     
+        reference_audio_waveform: torch.Tensor,           
+        reference_audio_sample_rate: int,
+        target_mel_spectrogram: torch.Tensor, # For loss calculation (B, N_MELS, S_mel_target)            
+        input_mel_spectrogram_shifted: torch.Tensor, # For teacher forcing (B, N_MELS, S_mel_input)     
+        text_attention_mask: Optional[torch.Tensor] = None, 
+        mel_actual_frame_mask: Optional[torch.Tensor] = None # (B, S_mel_target) True for actual frames
+    ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass. Handles training/validation (if return_loss=True) or inference.
-        For training: constructs combined embeddings, calculates loss.
-        For inference: processes inputs_embeds or input_ids for generation.
+        Forward pass of the GPT2TTSMelPredictor model.
+        Predicts mel spectrograms based on text and reference audio style.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        batch_size = text_input_ids.size(0)
+        device = text_input_ids.device
 
-        if return_loss: 
-            if texts is None or audio_waveforms is None: 
-                raise ValueError("texts and audio_waveforms required for return_loss=True.")
-            device = next(self.parameters()).device 
-            text_token_ids_list, audio_token_ids_list = self.preprocess_text_and_audio(texts, audio_waveforms, device)
+        # 1. Process Reference Audio for Style Conditioning
+        reference_audio_waveform = reference_audio_waveform.to(device)
+        ref_mel_spec_cond = self.mel_spectrogram_transform_ref(reference_audio_waveform) 
+        cond_enc_output = self.conditioning_encoder(ref_mel_spec_cond) 
+        style_embeddings = self.perceiver_resampler(cond_enc_output) # (B, num_latents, gpt_hidden_size)  
+
+        # 2. Prepare inputs for GPT-2's transformer
+        text_embeds = self.gpt2.transformer.wte(text_input_ids) # (B, S_text, gpt_hidden_size)
+        
+        # Project input mel frames (teacher-forcing) to GPT-2's hidden size
+        # input_mel_spectrogram_shifted shape: (B, N_MELS, S_mel_input)
+        input_mel_embeds_unprojected = input_mel_spectrogram_shifted.permute(0, 2, 1) # (B, S_mel_input, N_MELS)
+        input_mel_embeds = self.mel_input_projection(input_mel_embeds_unprojected) # (B, S_mel_input, gpt_hidden_size)
+
+        # Prepend start-of-mel embedding to the input mel sequence for GPT-2
+        start_mel_emb_batch = self.start_mel_embedding.expand(batch_size, -1, -1) # (B, 1, gpt_hidden_size)
+        
+        # Teacher-forcing input for mel part: [START_MEL_EMB, mel_frame_0_embed, ..., mel_frame_T-2_embed]
+        # This sequence will be used to predict [mel_frame_0, ..., mel_frame_T-1]
+        if input_mel_embeds.size(1) > 0: 
+            # Use (T-1) frames from input_mel_embeds, as the last one is not used to predict a next one
+            gpt2_mel_input_sequence = torch.cat([start_mel_emb_batch, input_mel_embeds[:, :-1, :]], dim=1) 
+        else: 
+            # If input_mel_embeds is empty (e.g. target is 1 frame long), only use start_mel_embedding
+            gpt2_mel_input_sequence = start_mel_emb_batch
+        
+        # Concatenate all embeddings for GPT-2 input
+        inputs_embeds = torch.cat([style_embeddings, text_embeds, gpt2_mel_input_sequence], dim=1)
+
+        # 3. Create attention mask for the combined sequence
+        if text_attention_mask is None: text_attention_mask = torch.ones_like(text_input_ids)
+        style_attention_mask = torch.ones(style_embeddings.shape[:2], dtype=torch.long, device=device)
+        mel_input_attention_mask = torch.ones(gpt2_mel_input_sequence.shape[:2], dtype=torch.long, device=device)
+        # Note: If gpt2_mel_input_sequence could have padding, its mask would need to reflect that.
+        
+        attention_mask = torch.cat([style_attention_mask, text_attention_mask, mel_input_attention_mask], dim=1)
+        
+        # Safeguard against exceeding GPT-2's max positions
+        current_seq_len = inputs_embeds.size(1)
+        if current_seq_len > self.gpt2_config.n_positions:
+            # This should be prevented by dataset preparation (MAX_TEXT_LEN_DATASET, MAX_MEL_FRAMES_DATASET)
+            print(f"Warning: Input sequence length ({current_seq_len}) exceeds GPT-2 max positions ({self.gpt2_config.n_positions}). Truncating.")
+            inputs_embeds = inputs_embeds[:, :self.gpt2_config.n_positions, :]
+            attention_mask = attention_mask[:, :self.gpt2_config.n_positions]
+
+
+        # 4. Pass through GPT-2 transformer blocks
+        transformer_outputs = self.gpt2.transformer(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        hidden_states = transformer_outputs.last_hidden_state 
+        
+        # Extract hidden states corresponding to the mel prediction part
+        num_style_latents = style_embeddings.size(1)
+        num_text_tokens = text_embeds.size(1)
+        start_mel_pred_idx = num_style_latents + num_text_tokens
+        
+        # The number of mel frames to predict is target_mel_spectrogram.size(2)
+        # The gpt2_mel_input_sequence has length equal to the number of frames we predict.
+        num_mel_frames_to_predict = gpt2_mel_input_sequence.size(1)
+        
+        # Hidden states for mel prediction
+        mel_hidden_states = hidden_states[:, start_mel_pred_idx : start_mel_pred_idx + num_mel_frames_to_predict, :]
+        # Predict mel frames using the modified lm_head
+        predicted_mel_frames_flat = self.gpt2.lm_head(mel_hidden_states) # (B, num_mel_frames_to_predict, N_MELS)
+        # Reshape to (B, N_MELS, num_mel_frames_to_predict)
+        predicted_mel_spectrogram = predicted_mel_frames_flat.permute(0, 2, 1)
+
+
+        # 5. Calculate Mel Prediction Loss
+        # Compare with target_mel_spectrogram
+        len_predicted = predicted_mel_spectrogram.size(2)
+        len_target = target_mel_spectrogram.size(2)
+        # The lengths should match if teacher forcing input was prepared correctly based on target length
+        min_len = min(len_predicted, len_target) 
+        
+        mel_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        if min_len > 0 : 
+            # Use mel_actual_frame_mask to compute loss only on actual (unpadded) frames
+            # Mask shape: (B, S_mel_target), needs to be (B, 1, S_mel_target) for broadcasting
+            current_mask = mel_actual_frame_mask[:, :min_len].unsqueeze(1).expand_as(predicted_mel_spectrogram[:,:,:min_len])
+
+            if model_config.MEL_LOSS_TYPE == "L1":
+                loss_per_frame = F.l1_loss(
+                    predicted_mel_spectrogram[:, :, :min_len], 
+                    target_mel_spectrogram[:, :, :min_len], 
+                    reduction='none' # Get per-element loss
+                )
+            elif model_config.MEL_LOSS_TYPE == "MSE":
+                loss_per_frame = F.mse_loss(
+                    predicted_mel_spectrogram[:, :, :min_len], 
+                    target_mel_spectrogram[:, :, :min_len],
+                    reduction='none' # Get per-element loss
+                )
+            else:
+                raise ValueError(f"Unknown mel_loss_type: {model_config.MEL_LOSS_TYPE}")
             
-            if not text_token_ids_list: 
-                return CausalLMOutputWithPast(loss=torch.tensor(0.0, device=device, requires_grad=True), 
-                                              logits=torch.empty((0,0,self.audio_vocab_size), device=device))
+            masked_loss = loss_per_frame * current_mask # Apply mask
+            # Average loss over actual frames only
+            mel_loss = masked_loss.sum() / current_mask.sum().clamp(min=1e-8) 
 
-            batch_input_embeds_list, batch_labels_list = [], []
-            for text_tokens, audio_tokens_original in zip(text_token_ids_list, audio_token_ids_list):
-                num_text_tokens = text_tokens.shape[0]
-                max_audio_len_context = self.config.n_positions - num_text_tokens - 2 # For BOS & EOS audio
-                if max_audio_len_context <= 0: continue 
+        if not mel_loss.requires_grad and min_len == 0 : 
+             mel_loss = mel_loss.clone().requires_grad_(True) # Ensure grad if loss is 0 due to no frames
 
-                effective_max_audio_len = min(max_audio_len_context, 
-                                              current_max_audio_tokens_for_curriculum or max_audio_len_context)
-                audio_tokens_tr = audio_tokens_original[:effective_max_audio_len]
-                if audio_tokens_tr.numel() == 0: continue
 
-                text_emb = self.gpt2_model.wte(text_tokens) 
-                bos_emb = self.audio_emb(torch.tensor([self.bos_audio_token_id], device=device))
-                audio_emb = self.audio_emb(audio_tokens_tr)
-                eos_emb = self.audio_emb(torch.tensor([self.eos_audio_token_id], device=device))
+        # 6. Calculate SCL Proxy Loss
+        scl_proxy_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        ref_spk_embed = None 
+        if self.speaker_encoder and model_config.SCL_PROXY_WEIGHT > 0:
+            ref_spk_embed = self.get_speaker_embedding(reference_audio_waveform, reference_audio_sample_rate)
+            
+            if ref_spk_embed is not None:
+                pooled_style_embed = style_embeddings.mean(dim=1) # (B, perceiver_latent_dim)
+                projected_style_embed = self.scl_style_projection(pooled_style_embed) 
                 
-                current_embeds = torch.cat([text_emb, bos_emb, audio_emb, eos_emb], dim=0)
-                current_labels = torch.cat([
-                    torch.full((num_text_tokens + 1,), -100, device=device, dtype=torch.long), # Ignore text & BOS
-                    audio_tokens_tr, torch.tensor([self.eos_audio_token_id], device=device, dtype=torch.long)
-                ], dim=0)
-                
-                if current_embeds.shape[0] != current_labels.shape[0]: continue
-                batch_input_embeds_list.append(current_embeds)
-                batch_labels_list.append(current_labels)
+                if projected_style_embed.shape == ref_spk_embed.shape:
+                    if model_config.SCL_PROXY_LOSS_TYPE == "cosine":
+                        scl_proxy_loss = 1.0 - F.cosine_similarity(projected_style_embed, ref_spk_embed, dim=1).mean()
+                    elif model_config.SCL_PROXY_LOSS_TYPE == "mse":
+                        scl_proxy_loss = F.mse_loss(projected_style_embed, ref_spk_embed)
+                else:
+                    # Warning only if dimensions mismatch, not tied to global_step
+                    print(f"Warning (SCL Proxy dim mismatch): Projected Style: {projected_style_embed.shape}, Ref Spk: {ref_spk_embed.shape}")
 
-            if not batch_input_embeds_list: 
-                return CausalLMOutputWithPast(loss=torch.tensor(0.0, device=device, requires_grad=True),
-                                              logits=torch.empty((0,0,self.audio_vocab_size), device=device))
 
-            padded_embeds = pad_sequence(batch_input_embeds_list, True, self.embedding_padding_value)
-            padded_labels = pad_sequence(batch_labels_list, True, -100)
-            attn_mask = (padded_labels != -100).long()
-            
-            if padded_embeds.shape[1] == 0:
-                 return CausalLMOutputWithPast(loss=torch.tensor(0.0, device=device, requires_grad=True),
-                                               logits=torch.empty((0,0,self.audio_vocab_size), device=device))
+        return {
+            "mel_loss": mel_loss,
+            "scl_proxy_loss": scl_proxy_loss,
+            "predicted_mel_spectrogram": predicted_mel_spectrogram, 
+            "style_embeddings": style_embeddings, 
+            "reference_speaker_embedding": ref_spk_embed 
+        }
 
-            gpt2_out = self.gpt2_model(inputs_embeds=padded_embeds, attention_mask=attn_mask, return_dict=True,
-                                       output_attentions=output_attentions, output_hidden_states=output_hidden_states)
-            logits = self.lm_head(gpt2_out.last_hidden_state)
-            loss = self.loss_fn(logits.view(-1, self.audio_vocab_size), padded_labels.view(-1))
-            
-            return CausalLMOutputWithPast(loss=loss, logits=logits, hidden_states=gpt2_out.hidden_states, attentions=gpt2_out.attentions)
-        else: # Inference
-            if inputs_embeds is None and input_ids is None: 
-                 raise ValueError("inputs_embeds or input_ids required for inference.")
-            
-            gpt2_args_filtered = {k: v for k, v in {
-                "input_ids": input_ids, "inputs_embeds": inputs_embeds, "attention_mask": attention_mask,
-                "past_key_values": past_key_values, "use_cache": use_cache, 
-                "output_attentions": output_attentions, "output_hidden_states": output_hidden_states,
-                "return_dict": True }.items() if v is not None}
-            
-            gpt2_out = self.gpt2_model(**gpt2_args_filtered) 
-            logits = self.lm_head(gpt2_out.last_hidden_state) 
-            return CausalLMOutputWithPast(logits=logits, past_key_values=gpt2_out.past_key_values, 
-                                          hidden_states=gpt2_out.hidden_states, attentions=gpt2_out.attentions)
-
-    def prepare_inputs_for_generation(self, input_ids: torch.LongTensor, 
-                                      past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None, 
-                                      **kwargs) -> dict:
-        """
-        Prepares inputs for Hugging Face .generate().
-        Converts input_ids (text or audio) to embeddings.
-        """
-        attention_mask = kwargs.get("attention_mask")
-        prompt_text_length = kwargs.get("prompt_text_length")
-        current_embeds: torch.Tensor
-
-        if past_key_values is None: # First step of generation
-            text_len = prompt_text_length if prompt_text_length is not None else input_ids.shape[1] - 1
-            text_tokens = input_ids[:, :text_len]
-            bos_audio_tokens = input_ids[:, text_len:] # Should be BOS_AUDIO_ID
-
-            text_emb = self.gpt2_model.wte(text_tokens)
-            bos_emb = self.audio_emb(torch.clamp(bos_audio_tokens, 0, self.audio_vocab_size - 1)) if bos_audio_tokens.numel() > 0 else text_emb # Fallback for safety
-            current_embeds = torch.cat([text_emb, bos_emb], dim=1) if bos_audio_tokens.numel() > 0 else text_emb
-        else: # Subsequent steps: input_ids is the last generated audio token
-            last_audio_tokens = torch.clamp(input_ids[:, -1:], 0, self.audio_vocab_size - 1)
-            current_embeds = self.audio_emb(last_audio_tokens)
+    def decode_mels_to_waveform(self, mel_spectrograms: torch.Tensor) -> Optional[torch.Tensor]:
+        """ Decodes mel spectrograms to waveform using the HiFi-GAN vocoder. """
+        if self.hifi_gan is None:
+            print("HiFi-GAN vocoder not available.")
+            return None
         
-        if attention_mask is not None and past_key_values is not None: # Extend attention mask
-            attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), 
-                                       dtype=attention_mask.dtype, device=attention_mask.device)], dim=1)
-        
-        return {"inputs_embeds": current_embeds, "input_ids": None, 
-                "past_key_values": past_key_values, "use_cache": kwargs.get("use_cache", self.config.use_cache), 
-                "attention_mask": attention_mask}
-
-    def prepare_prompt_for_generation(self, texts: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """
-        Prepares initial input_ids, attention_mask, and text_token_length for .generate().
-        Helper for `generate_speech` in `utils.py`.
-        """
-        if not texts or not texts[0]: raise ValueError("Input text list is empty or first text is empty.")
-        text = texts[0] 
-        max_text_tokens = self.config.n_positions // 3 
-        text_encoding = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=max_text_tokens)
-        text_token_ids = text_encoding.input_ids.to(device)
-        if text_token_ids.numel() == 0: raise ValueError(f"Text '{text[:60]}...' resulted in empty tokens.")
-        
-        prompt_text_attn_mask = text_encoding.attention_mask.to(device)
-        bos_audio_id = torch.tensor([[self.bos_audio_token_id]], dtype=torch.long, device=device)
-        
-        initial_ids = torch.cat([text_token_ids, bos_audio_id], dim=1)
-        initial_attn_mask = torch.cat([prompt_text_attn_mask, torch.ones_like(bos_audio_id)], dim=1)
-        
-        return initial_ids, initial_attn_mask, text_token_ids.shape[1]
-
-    def decode_audio_tokens(self, audio_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Decodes flattened Encodec audio tokens into a waveform.
-        Assumes audio_tokens are valid codebook indices.
-        """
-        if audio_tokens.dim() == 1: audio_tokens = audio_tokens.unsqueeze(0)
-        batch_size, flat_len = audio_tokens.shape
-        if flat_len == 0: return torch.empty(batch_size, 0, device=audio_tokens.device)
-        
-        # Clamp to codebook_size just in case, though filtering should occur before.
-        audio_tokens = torch.clamp(audio_tokens, 0, self.codebook_size - 1)
-
-        # Truncate to be divisible by num_codebooks
-        if flat_len % self.num_audio_codebooks != 0:
-            flat_len = (flat_len // self.num_audio_codebooks) * self.num_audio_codebooks
-            audio_tokens = audio_tokens[:, :flat_len]
-            if flat_len == 0: return torch.empty(batch_size, 0, device=audio_tokens.device)
-        
-        # Reshape: (B, T_flat) -> (B, T_frames, Nq) -> permute to (B, Nq, T_frames)
-        audio_codes_reshaped = audio_tokens.reshape(batch_size, -1, self.num_audio_codebooks).permute(0, 2, 1)
-        # Encodec expects 4D: (num_chunks=1, B, Nq, T_frames)
-        audio_codes_for_decoder = audio_codes_reshaped.unsqueeze(0)
-        
-        scales = torch.ones((1, batch_size), device=audio_codes_for_decoder.device, dtype=torch.float32)
-
+        # HiFi-GAN's first Conv1d expects input (B, N_MELS, T_FRAMES).
+        # `mel_spectrograms` should already be in this format.
         with torch.no_grad():
-            self.codec.to(audio_codes_for_decoder.device)
-            decoded_output = self.codec.decode(audio_codes_for_decoder, audio_scales=scales)
-        
-        final_audio = decoded_output[0].squeeze(0) # Remove chunk dim
-        return final_audio.squeeze(0) if batch_size == 1 and final_audio.dim() > 1 else final_audio
+            waveforms = self.hifi_gan.decode_batch(mel_spectrograms) 
+        return waveforms.squeeze(1) # Output shape: (B, T_samples)
+
+    @classmethod
+    def from_pretrained_custom(cls, tokenizer: GPT2Tokenizer, 
+                               checkpoint_path: Optional[str] = None, 
+                               device: torch.device = model_config.DEVICE):
+        """ Loads model from checkpoint or initializes new. """
+        model = cls(tokenizer=tokenizer) 
+        if checkpoint_path:
+            try:
+                state_dict = torch.load(checkpoint_path, map_location=device)
+                if all(k.startswith('module.') for k in state_dict.keys()): # Handle DataParallel prefix
+                    state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+                
+                current_model_dict = model.state_dict()
+                filtered_state_dict = {}
+                for k, v in state_dict.items():
+                    if k in current_model_dict and current_model_dict[k].size() == v.size():
+                        # Exclude speaker_encoder and hifi_gan from checkpoint loading
+                        if not k.startswith("speaker_encoder.") and not k.startswith("hifi_gan."):
+                            filtered_state_dict[k] = v
+                model.load_state_dict(filtered_state_dict, strict=False)
+                print(f"Loaded model weights from {checkpoint_path} (excluding speaker_encoder and hifi_gan).")
+            except Exception as e:
+                print(f"Error loading checkpoint {checkpoint_path}: {e}. Initializing new model.")
+        model.to(device)
+        return model
+
+    # Methods for Hugging Face `generate` compatibility (if used, needs careful adaptation for mel)
+    def get_input_embeddings(self): 
+        return self.gpt2.transformer.wte
+
+    def get_output_embeddings(self): 
+        return self.gpt2.lm_head # This is now the mel prediction linear layer
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        """
+        Prepares inputs for generation.
+        This is primarily for Hugging Face's `model.generate()` method.
+        For manual autoregressive loops (like in utils.generate_speech_mel),
+        input preparation is handled directly in the loop.
+        """
+        # `input_ids` in this context (if using HF generate for mel) would represent
+        # the embedding of the previously generated mel frame or a start token.
+        # This function is a STUB and would need significant work if relying on model.generate().
+        current_input_embeds = input_ids 
+
+        attention_mask = kwargs.get("attention_mask")
+        if past_key_values is not None and attention_mask is not None:
+            new_mask_token = torch.ones((attention_mask.size(0), 1), dtype=torch.long, device=attention_mask.device)
+            attention_mask = torch.cat([attention_mask, new_mask_token], dim=1)
+
+        if current_input_embeds.ndim == 2: # Ensure (B, 1, H) for single token embedding
+            current_input_embeds = current_input_embeds.unsqueeze(1)
+            
+        return {
+            "inputs_embeds": current_input_embeds, 
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache", True),
+            "attention_mask": attention_mask,
+        }
